@@ -1,0 +1,184 @@
+# Author: Chaitanya
+# Last modified by: Chaitanya
+# Description: Deploy Core + Omni separately using delta - MAIN only
+
+name: Deploy to Main
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deployment-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
+
+    steps:
+
+      # ==========================================
+      # SETUP
+      # ==========================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22.x'
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      - name: Install sfdx-git-delta
+        run: echo y | sf plugins install sfdx-git-delta@latest-rc
+
+      # ==========================================
+      # AUTHENTICATE TO MAIN / PROD
+      # ==========================================
+
+      - name: Authenticate with Salesforce
+        run: |
+          echo "${{ secrets.PROD_SFDX }}" > authFile.txt
+
+          sf org login sfdx-url \
+            --sfdx-url-file authFile.txt \
+            --set-default
+
+      # ==========================================
+      # CORE DELTA GENERATION
+      # ==========================================
+
+      - name: Generate Core Delta
+        run: |
+          git fetch --all
+
+          FROM=$(git rev-parse HEAD~1)
+          TO=HEAD
+
+          echo "FROM = $FROM"
+          echo "TO = $TO"
+
+          cat > .sgdexclude << 'END'
+          **/omniIntegrationProcedures/**
+          **/omniScripts/**
+          **/omniUiCard/**
+          **/omniDataTransforms/**
+          **/expressionSetDefinition/**
+          **/expressionSetVersion/**
+          END
+
+          echo "Generating Core Delta..."
+
+          sf sgd source delta \
+            --to $TO \
+            --from $FROM \
+            --output-dir . \
+            --ignore-file .sgdexclude \
+            --generate-delta
+
+          echo "===== Core Package ====="
+          cat package/package.xml || echo "No Core changes"
+
+      # ==========================================
+      # CORE DEPLOYMENT
+      # ==========================================
+
+      - name: Deploy Core Metadata
+        run: |
+          PACKAGE_FILE="package/package.xml"
+
+          if [ ! -f "$PACKAGE_FILE" ] || ! grep -q '<types>' "$PACKAGE_FILE"; then
+            echo "No Core changes → Skipping deployment."
+            exit 0
+          fi
+
+          echo "Deploying Core changes to MAIN..."
+
+          sf project deploy start \
+            --manifest package/package.xml \
+            --ignore-conflicts \
+            --ignore-warnings \
+            --test-level RunRelevantTests \
+            --pre-destructive-changes manifest/destructive-changes/pre.xml \
+            --post-destructive-changes manifest/destructive-changes/post.xml \
+            --wait 120 \
+            --verbose
+
+      # ==========================================
+      # CLEANUP BEFORE OMNI
+      # ==========================================
+
+      - name: Cleanup Package Folder
+        run: |
+          rm -rf package
+          rm -rf destructiveChanges
+
+      # ==========================================
+      # OMNI DELTA GENERATION
+      # ==========================================
+
+      - name: Generate Omni Delta
+        run: |
+          git fetch --all
+
+          FROM=$(git rev-parse HEAD~1)
+          TO=HEAD
+
+          echo "FROM = $FROM"
+          echo "TO = $TO"
+
+          echo "Generating Omni Delta..."
+
+          sf sgd source delta \
+            --to $TO \
+            --from $FROM \
+            --output-dir . \
+            --source-dir force-app/main/default/omniIntegrationProcedures \
+            --source-dir force-app/main/default/omniScripts \
+            --source-dir force-app/main/default/omniUiCard \
+            --source-dir force-app/main/default/omniDataTransforms \
+            --source-dir force-app/main/default/expressionSetDefinition \
+            --source-dir force-app/main/default/expressionSetVersion \
+            --generate-delta
+
+          echo "===== Omni Package ====="
+          cat package/package.xml || echo "No Omni changes"
+
+      # ==========================================
+      # OMNI DEPLOYMENT
+      # ==========================================
+
+      - name: Deploy Omni Metadata
+        run: |
+          PACKAGE_FILE="package/package.xml"
+
+          if [ ! -f "$PACKAGE_FILE" ] || ! grep -q '<types>' "$PACKAGE_FILE"; then
+            echo "No Omni changes → Skipping deployment."
+            exit 0
+          fi
+
+          echo "Deploying Omni changes to MAIN..."
+
+          sf project deploy start \
+            --manifest package/package.xml \
+            --ignore-conflicts \
+            --ignore-warnings \
+            --test-level RunRelevantTests \
+            --pre-destructive-changes manifest/destructive-changes/pre.xml \
+            --post-destructive-changes manifest/destructive-changes/post.xml \
+            --wait 120 \
+            --verbose
