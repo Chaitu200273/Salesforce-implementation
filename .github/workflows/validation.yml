@@ -1,0 +1,192 @@
+# -------------------------------------------------------------
+# Author: Chaitanya
+# Description:
+# Validates Pull Requests targeting main.
+# - Generates a delta for changed metadata.
+# - Validates changed Apex classes using related tests.
+# - Validates non-Apex metadata using NoTestRun.
+# - Skips OmniScripts/OmniIntegrationProcedures and related components.
+# -------------------------------------------------------------
+
+name: Validate Pull Request - Main
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, synchronize, reopened]
+    branches:
+      - main
+
+jobs:
+  Salesforce_Validation:
+    runs-on: ubuntu-latest
+
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
+
+    steps:
+
+      # ==========================================
+      # SETUP
+      # ==========================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      - name: Install sfdx-git-delta
+        run: echo y | sf plugins install sfdx-git-delta@latest
+
+      # ==========================================
+      # AUTHENTICATE TO MAIN / PROD
+      # ==========================================
+
+      - name: Authenticate to Salesforce
+        run: |
+          echo "${{ secrets.PROD_SFDX }}" > authFile.txt
+
+          sf org login sfdx-url \
+            --sfdx-url-file authFile.txt \
+            --set-default
+
+      # ==========================================
+      # GENERATE DELTA
+      # ==========================================
+
+      - name: Generate Delta
+        run: |
+          SOURCE="${{ github.head_ref }}"
+          TARGET="${{ github.base_ref }}"
+
+          echo "PR Flow: $SOURCE → $TARGET"
+
+          git fetch origin "$SOURCE"
+          git fetch origin "$TARGET"
+
+          BASE=$(git merge-base "origin/$SOURCE" "origin/$TARGET")
+
+          echo "BASE = $BASE"
+
+          mkdir -p delta
+
+          cat > .sgdexclude << 'END'
+          **/omniIntegrationProcedures/**
+          **/omniScripts/**
+          **/omniUiCard/**
+          **/omniDataTransforms/**
+          **/expressionSetDefinition/**
+          **/expressionSetVersion/**
+          END
+
+          echo "Generating delta..."
+
+          sf sgd source delta \
+            --to "origin/$SOURCE" \
+            --from "$BASE" \
+            --output-dir delta \
+            --ignore-file .sgdexclude \
+            --generate-delta
+
+          echo "========== Generated Delta =========="
+          cat delta/package/package.xml || echo "No changes detected."
+          echo "====================================="
+
+      # ==========================================
+      # PREPARE PACKAGE
+      # ==========================================
+
+      - name: Prepare Package
+        run: |
+          mkdir -p parsed_changes
+
+          if [ -f delta/package/package.xml ]; then
+            mv delta/package/package.xml parsed_changes/
+            echo "delta=true" >> "$GITHUB_ENV"
+            echo "Delta package.xml prepared."
+          else
+            echo "No deployable changes found."
+            echo "run_tests=skip" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+      # ==========================================
+      # DISPLAY PACKAGE
+      # ==========================================
+
+      - name: Display package.xml
+        run: |
+          echo "========== package.xml =========="
+          cat parsed_changes/package.xml
+          echo "================================="
+
+      # ==========================================
+      # SALESFORCE VALIDATION
+      # ==========================================
+
+      - name: Salesforce Validation
+        run: |
+          PACKAGE_FILE="parsed_changes/package.xml"
+
+          if ! grep -q '<types>' "$PACKAGE_FILE"; then
+            echo "package.xml contains no deployable metadata."
+            exit 0
+          fi
+
+          echo "Checking Apex metadata..."
+
+          APEX_CLASS_COUNT=$(grep -c "<name>ApexClass</name>" "$PACKAGE_FILE" || true)
+
+          echo "APEX_CLASS_COUNT = $APEX_CLASS_COUNT"
+
+          VALIDATE_EXIT=0
+
+          if [ "$APEX_CLASS_COUNT" -gt 0 ]; then
+
+            echo "Apex changes detected."
+            echo "Running RunRelevantTests..."
+
+            sf project deploy start \
+              --manifest "$PACKAGE_FILE" \
+              --ignore-warnings \
+              --dry-run \
+              --test-level RunRelevantTests \
+              --pre-destructive-changes manifest/destructive-changes/pre.xml \
+              --post-destructive-changes manifest/destructive-changes/post.xml \
+              --wait 60 \
+              --verbose
+
+            VALIDATE_EXIT=$?
+
+          else
+
+            echo "No Apex changes detected."
+            echo "Running NoTestRun..."
+
+            sf project deploy start \
+              --manifest "$PACKAGE_FILE" \
+              --ignore-warnings \
+              --dry-run \
+              --test-level NoTestRun \
+              --pre-destructive-changes manifest/destructive-changes/pre.xml \
+              --post-destructive-changes manifest/destructive-changes/post.xml \
+              --wait 60 \
+              --verbose
+
+            VALIDATE_EXIT=$?
+
+          fi
+
+          if [ $VALIDATE_EXIT -ne 0 ]; then
+            echo "❌ Validation Failed."
+            exit $VALIDATE_EXIT
+          fi
+
+          echo "✅ Validation Passed Successfully."
